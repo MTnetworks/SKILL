@@ -121,8 +121,8 @@ headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json
 
 # ========== 用户信息 ==========
 name = "陈座娣"
-plate = "粤BF78K9"
-phone = "13480980227"
+plate = "粤BF7889"
+phone = "13480980000"
 unit = "卫生健康局"       # 组织名称关键字
 seal_name = "地面月卡"    # 套餐名称
 seal_id = "p220447822150" # 套餐ID
