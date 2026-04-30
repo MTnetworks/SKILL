@@ -32,7 +32,7 @@ urllib3.disable_warnings()
 # ==================== 配置 ====================
 BASE_URL = "https://10.0.12.1:9091"
 ACCOUNT = "9999"
-PASSWORD = "Tcc87860903"
+PASSWORD = "88888888"
 
 # 本地表格路径 (Windows路径 -> WSL路径)
 XLSX_PATH = "/mnt/f/ShareCache/智能化系统/门禁系统/2024政府年门禁、车牌审核汇总表.xlsx"
