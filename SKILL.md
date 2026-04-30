@@ -25,7 +25,7 @@ triggers:
 ## 认证信息
 
 - **账号**: 9999
-- **密码**: Tcc87860903
+- **密码**: 88888888
 - **登录API**: `/api/systemcenter/auth/login`
 - **密码加密**: MD5
 
@@ -49,7 +49,7 @@ import requests
 
 # 登录获取Token
 base_url = "https://10.0.12.1:9091"
-password_md5 = hashlib.md5("Tcc87860903".encode()).hexdigest()
+password_md5 = hashlib.md5("88888888".encode()).hexdigest()
 resp = requests.post(
     f"{base_url}/api/systemcenter/auth/login",
     json={"account": "9999", "password": password_md5},
@@ -375,7 +375,7 @@ import hashlib, requests, urllib3
 urllib3.disable_warnings()
 
 base_url = "https://10.0.12.1:9091"
-pw = hashlib.md5("Tcc87860903".encode()).hexdigest()
+pw = hashlib.md5("88888888".encode()).hexdigest()
 r = requests.post(f"{base_url}/api/systemcenter/auth/login",
     json={"account": "9999", "password": pw}, verify=False, timeout=10)
 token = r.json()['data']['token']
