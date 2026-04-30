@@ -466,7 +466,7 @@ python parking_helper.py add 专班 张一 粤S22222 18099996666
 python parking_helper.py modify 张一 粤S22222
 
 # 新增人员（API创建用户+凭证+月租 + 本地表格同步）
-python parking_helper.py add 卫生健康局 陈座娣 粤BF78K9 13480980227 地面月卡 2030-12-30 借调
+python parking_helper.py add 卫生健康局 陈座娣 粤BF7889 13480980000 地面月卡 2030-12-30 借调
 ```
 
 ## 日期计算
