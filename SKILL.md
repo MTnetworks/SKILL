@@ -1,6 +1,6 @@
 ---
 name: parking-whitelist
-description: 停车场系统管理 - 黑白名单管理、用户管理、月租车开通、车牌凭证管理
+description: 停车场系统管理 - 黑白名单管理、用户管理、月租车开通、车牌凭证管理、删除人员注销车牌
 triggers:
   - 白名单
   - 黑名单
@@ -10,6 +10,10 @@ triggers:
   - 月租车
   - 新增用户
   - 开通月租
+  - 删除用户
+  - 注销车牌
+  - 删除人员
+  - 批量迁出
 ---
 
 # 停车场系统管理功能
@@ -129,11 +133,27 @@ seal_id = "p220447822150" # 套餐ID
 end_time = "2030-12-30T23:59:59"
 remark = "借调"
 
-# ========== 步骤1: 查询组织ID ==========
-r = requests.get(f"{base_url}/api/systemcenter/group",
-    headers=headers, params={"pageIndex": 0, "pageSize": 100}, verify=False)
-groups = r.json()['data']['rows']
-group_id = next((g['id'] for g in groups if unit in g['name']), None)
+# ========== 步骤1: 查询组织ID（分页遍历获取全部） ==========
+all_groups = []
+page = 0
+while True:
+    r = requests.get(f"{base_url}/api/systemcenter/group",
+        headers=headers, params={"pageIndex": page, "pageSize": 100}, verify=False)
+    rows = r.json()['data']['rows']
+    all_groups.extend(rows)
+    total = r.json()['data'].get('total', 0)
+    if len(all_groups) >= total or not rows:
+        break
+    page += 1
+
+# 匹配组织：精确匹配 → 用户输入包含在组织名中 → 组织名包含在用户输入中
+group_id = None
+for match_fn in [lambda g: g['name'] == unit, lambda g: unit in g['name'], lambda g: g['name'] in unit]:
+    found = next((g for g in all_groups if match_fn(g)), None)
+    if found:
+        group_id = found['id']
+        unit = found['name']  # 使用API返回的完整组织名
+        break
 
 # ========== 步骤2: 获取新用户编号 ==========
 r = requests.get(f"{base_url}/api/systemcenter/person/newId", headers=headers, verify=False)
@@ -409,6 +429,101 @@ r2 = requests.put(f"{base_url}/api/parkmanagement/pmsLeaseStall/{lease_id}",
 
 ---
 
+## 功能七：删除人员并注销车牌
+
+### 删除规则（重要）
+
+| 操作方式 | 对应系统模块 | 效果 |
+|----------|-------------|------|
+| **删除姓名** | 用户管理 → 搜索姓名 → 批量迁出 | 删除用户信息 **+** 同时删除关联车牌凭证 |
+| **删除车牌** | 凭证管理 → 搜索车牌 → 注销 | **仅注销车牌凭证**，用户信息保留 |
+| **按车牌完全删除** | 先凭证管理注销车牌 → 再用户管理批量迁出 | 车牌注销 + 用户信息删除（完整清理） |
+
+### 判断逻辑
+
+- **用户说「删除姓名：xxx」** → 直接去用户管理搜索姓名，执行批量迁出（会同时删除用户和车牌）
+- **用户说「删除车牌：粤Sxxxxx」** → 先去凭证管理注销车牌，再去用户管理删除用户信息
+
+### API流程
+
+#### 方式一：按姓名删除（批量迁出）
+
+```
+1. 登录获取Token
+2. 查询用户 (GET /api/systemcenter/person?name=姓名)
+3. 批量迁出 (PATCH /api/systemcenter/person/moveOut)
+   → 同时删除用户信息和关联车牌凭证
+4. 同步删除本地Excel记录（可选）
+```
+
+```python
+import hashlib, requests, urllib3
+urllib3.disable_warnings()
+
+base_url = "https://10.0.12.1:9091"
+headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+# 查询用户
+params = {"pageIndex": 0, "pageSize": 20, "name": "张一"}
+resp = requests.get(f"{base_url}/api/systemcenter/person",
+    headers=headers, params=params, verify=False)
+persons = resp.json()['data']['rows']
+
+# 批量迁出（同时删除用户 + 关联凭证）
+person_ids = [p["id"] for p in persons]
+resp = requests.patch(f"{base_url}/api/systemcenter/person/moveOut",
+    headers=headers, json={"ids": person_ids, "isServicesCancelled": True}, verify=False)
+```
+
+#### 方式二：按车牌删除（先注销再迁出）
+
+```
+1. 登录获取Token
+2. 查询凭证 (GET /api/systemcenter/credential?credentialNo=车牌号)
+3. 注销凭证 (PATCH /api/systemcenter/credential) → 设置 status=4
+4. 查询用户 (GET /api/systemcenter/person?name=车主姓名)
+5. 批量迁出 (PATCH /api/systemcenter/person/moveOut)
+6. 同步删除本地Excel记录（可选）
+```
+
+```python
+# 步骤1: 查询凭证
+params = {"pageIndex": 0, "pageSize": 20, "credentialNo": "粤S22222"}
+resp = requests.get(f"{base_url}/api/systemcenter/credential",
+    headers=headers, params=params, verify=False)
+creds = resp.json()['data']['rows']
+
+# 步骤2: 注销凭证（PATCH status=4，批量注销）
+active_cred_ids = [c["id"] for c in creds if c.get("status") == 1]
+if active_cred_ids:
+    resp = requests.patch(f"{base_url}/api/systemcenter/credential",
+        headers=headers, json={"ids": active_cred_ids, "status": 4}, verify=False)
+
+# 步骤3: 获取车主姓名后查询用户
+person_name = creds[0].get("personName", "")
+params = {"pageIndex": 0, "pageSize": 20, "name": person_name}
+resp = requests.get(f"{base_url}/api/systemcenter/person",
+    headers=headers, params=params, verify=False)
+persons = resp.json()['data']['rows']
+
+# 步骤4: 批量迁出
+person_ids = [p["id"] for p in persons]
+resp = requests.patch(f"{base_url}/api/systemcenter/person/moveOut",
+    headers=headers, json={"ids": person_ids, "isServicesCancelled": True}, verify=False)
+```
+
+### 命令行工具
+
+```bash
+# 按姓名删除（批量迁出，同时删除用户和车牌）
+python parking_helper.py delete-name 张一
+
+# 按车牌删除（先注销车牌，再批量迁出删除用户）
+python parking_helper.py delete-plate 粤S22222
+```
+
+---
+
 ## 本地表格同步
 
 系统会自动将人员和车牌信息同步到本地Excel表格。
@@ -420,6 +535,7 @@ r2 = requests.put(f"{base_url}/api/parkmanagement/pmsLeaseStall/{lease_id}",
 |------|-------------------|
 | 修改车牌信息 | ✅ 同步修改 |
 | 新增人员和车牌 | ✅ 同步添加 |
+| 删除人员（按姓名/按车牌） | ✅ 同步删除 |
 | 添加黑/白/灰名单 | ❌ 不同步 |
 
 **表格列结构**: 单位名称、类型、工作证编号、姓名、职务、车牌号码、联系电话、备注
@@ -458,6 +574,8 @@ python parking_helper.py add 专班 张一 粤S22222 18099996666
 - "添加用户张三，手机138xxxxxxxx，组织专班，车牌粤A12345，有效期到2030-12-30"
 - "查询粤S9012的名单状态"
 - "修改用户朱xx的车牌为粤Sxxxx"
+- "删除姓名：张三" → 用户管理批量迁出，同时删除用户和车牌
+- "删除车牌：粤S22222" → 先注销车牌凭证，再批量迁出删除用户
 
 ### 命令行工具示例
 
@@ -467,6 +585,12 @@ python parking_helper.py modify 张一 粤S22222
 
 # 新增人员（API创建用户+凭证+月租 + 本地表格同步）
 python parking_helper.py add 卫生健康局 陈座娣 粤BF7889 13480980000 地面月卡 2030-12-30 借调
+
+# 按姓名删除（批量迁出，同时删除用户和关联车牌）
+python parking_helper.py delete-name 张一
+
+# 按车牌删除（先注销车牌凭证，再批量迁出删除用户）
+python parking_helper.py delete-plate 粤S22222
 ```
 
 ## 日期计算
@@ -479,4 +603,9 @@ python parking_helper.py add 卫生健康局 陈座娣 粤BF7889 13480980000 地
 
 ## 组织代码参考
 
-常用组织名称和ID需要在首次使用时从 `/api/systemcenter/group` 获取。
+组织列表通过 `/api/systemcenter/group` 获取，**API限制pageSize最大100**，必须分页遍历（pageSize=100）直至取完全部记录，否则可能遗漏组织导致"找不到组织"错误。
+
+组织匹配逻辑（按优先级）：
+1. 精确匹配：用户输入 == 组织名
+2. 子串匹配：用户输入包含在组织名中（如"三联村委"匹配"三联村民委员会"）
+3. 反向子串匹配：组织名包含在用户输入中
