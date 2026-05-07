@@ -6,16 +6,22 @@
 1. 修改车牌 → API修改 + 同步更新本地表格
 2. 新增人员+车牌 → API创建用户+添加凭证+开通月租 + 同步本地表格
 3. 黑白名单操作 → 仅API操作，不同步本地表格
+4. 删除人员(按姓名) → 用户管理批量迁出，同时删除用户和关联车牌凭证
+5. 删除人员(按车牌) → 先注销车牌凭证，再批量迁出删除用户信息
 
 表格路径: F:\ShareCache\智能化系统\门禁系统\2024政府年门禁、车牌审核汇总表.xlsx
 
 使用方法：
   python parking_helper.py modify <姓名> <新车牌>
   python parking_helper.py add <单位> <姓名> <车牌> <电话> <套餐> <有效期> [备注]
+  python parking_helper.py delete-name <姓名>
+  python parking_helper.py delete-plate <车牌号>
 
 示例：
   python parking_helper.py modify 张一 粤S22222
   python parking_helper.py add 卫生健康局 陈座娣 粤BF78K9 13480980227 地面月卡 2030-12-30 借调
+  python parking_helper.py delete-name 张一
+  python parking_helper.py delete-plate 粤S22222
 """
 
 import hashlib
@@ -86,20 +92,39 @@ def get_headers(token):
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 def get_groups(token):
-    """获取组织列表"""
-    r = requests.get(
-        f"{BASE_URL}/api/systemcenter/group",
-        headers=get_headers(token),
-        params={"pageIndex": 0, "pageSize": 100},
-        verify=False, timeout=10
-    )
-    return r.json().get('data', {}).get('rows', [])
+    """获取组织列表（分页遍历获取全部）"""
+    all_rows = []
+    page = 0
+    while True:
+        r = requests.get(
+            f"{BASE_URL}/api/systemcenter/group",
+            headers=get_headers(token),
+            params={"pageIndex": page, "pageSize": 100},
+            verify=False, timeout=10
+        )
+        rows = r.json().get('data', {}).get('rows', [])
+        all_rows.extend(rows)
+        total = r.json().get('data', {}).get('total', 0)
+        if len(all_rows) >= total or not rows:
+            break
+        page += 1
+    return all_rows
 
 def find_group_id(token, group_name_hint: str):
     """根据名称提示找组织ID"""
+    hint = group_name_hint.strip()
     groups = get_groups(token)
+    # 精确匹配
     for g in groups:
-        if group_name_hint in g.get('name', ''):
+        if g.get('name', '') == hint:
+            return g['id'], g['name']
+    # 用户输入包含在组织名中
+    for g in groups:
+        if hint in g.get('name', ''):
+            return g['id'], g['name']
+    # 组织名包含在用户输入中
+    for g in groups:
+        if g.get('name', '') and g['name'] in hint:
             return g['id'], g['name']
     return None, None
 
@@ -234,6 +259,66 @@ def find_lease_by_name(token, name: str):
     rows = r.json().get('data', {}).get('rows', [])
     return rows[0] if rows else None
 
+# ==================== 凭证管理 & 用户删除 ====================
+
+def query_credential(token, keyword: str, by_name: bool = False, page_size: int = 20):
+    """查询凭证（按车牌号或姓名）"""
+    params = {"pageIndex": 0, "pageSize": page_size}
+    if by_name:
+        params["personName"] = keyword
+    else:
+        params["credentialNo"] = keyword
+    r = requests.get(
+        f"{BASE_URL}/api/systemcenter/credential",
+        headers=get_headers(token), params=params, verify=False, timeout=10
+    )
+    res = r.json()
+    if res.get('code') == 200:
+        return res.get('data', {}).get('rows', [])
+    return []
+
+def cancel_credential(token, credential_ids):
+    """注销凭证（PATCH status=4）"""
+    if isinstance(credential_ids, str):
+        credential_ids = [credential_ids]
+    data = {"ids": credential_ids, "status": 4}
+    r = requests.patch(
+        f"{BASE_URL}/api/systemcenter/credential",
+        headers=get_headers(token), json=data, verify=False, timeout=10
+    )
+    res = r.json()
+    if res.get('code') == 200:
+        return True, "凭证注销成功"
+    return False, f"凭证注销失败: {res}"
+
+def query_person(token, name: str, page_size: int = 20):
+    """查询用户（按姓名）"""
+    params = {"pageIndex": 0, "pageSize": page_size}
+    if name:
+        params["name"] = name
+    r = requests.get(
+        f"{BASE_URL}/api/systemcenter/person",
+        headers=get_headers(token), params=params, verify=False, timeout=10
+    )
+    res = r.json()
+    if res.get('code') == 200:
+        return res.get('data', {}).get('rows', [])
+    return []
+
+def batch_migrate_out(token, person_ids):
+    """批量迁出用户（同时删除用户信息和关联凭证）"""
+    if isinstance(person_ids, str):
+        person_ids = [person_ids]
+    data = {"ids": person_ids, "isServicesCancelled": True}
+    r = requests.patch(
+        f"{BASE_URL}/api/systemcenter/person/moveOut",
+        headers=get_headers(token), json=data, verify=False, timeout=15
+    )
+    res = r.json()
+    if res.get('code') == 200:
+        return True, "批量迁出成功（用户信息及关联凭证已删除）"
+    return False, f"批量迁出失败: {res}"
+
 def update_plate(token, lease_id: str, person_info: dict, new_plate: str, plate_color: int = None):
     """修改车牌"""
     if plate_color is None:
@@ -300,28 +385,28 @@ def sync_add_person(unit: str, name: str, plate: str, phone: str, position: str 
     """新增人员 - 同步到本地表格"""
     wb = openpyxl.load_workbook(XLSX_PATH)
     ws = wb.active
-    
+
     # 检查是否已存在
     for row in range(1, ws.max_row + 1):
         if ws.cell(row=row, column=COL_NAME).value == name:
             print(f"  ⚠️ {name} 已存在于本地表格第{row}行")
             wb.close()
             return False
-    
+
     # 找最后有效数据行
     last_data_row = ws.max_row
     while last_data_row > 1 and ws.cell(row=last_data_row, column=COL_NAME).value is None:
         last_data_row -= 1
-    
+
     next_row = last_data_row + 1
-    
+
     # 获取下一个工作证编号
     last_work_id = ws.cell(row=last_data_row, column=COL_WORK_ID).value
     try:
         work_id = int(last_work_id) + 1 if last_work_id else next_row - 1
     except:
         work_id = next_row - 1
-    
+
     ws.cell(row=next_row, column=COL_UNIT, value=unit)
     ws.cell(row=next_row, column=COL_TYPE, value="工作证")
     ws.cell(row=next_row, column=COL_WORK_ID, value=work_id)
@@ -331,10 +416,26 @@ def sync_add_person(unit: str, name: str, plate: str, phone: str, position: str 
     ws.cell(row=next_row, column=COL_PLATE).alignment = Alignment(wrap_text=True)
     ws.cell(row=next_row, column=COL_PHONE, value=phone)
     ws.cell(row=next_row, column=COL_REMARK, value=remark)
-    
+
     wb.save(XLSX_PATH)
     print(f"  ✅ 本地表格已添加: {name} 到第{next_row}行")
     return True
+
+def sync_delete_person(name: str):
+    """删除人员 - 同步到本地表格（删除整行）"""
+    wb = openpyxl.load_workbook(XLSX_PATH)
+    ws = wb.active
+
+    for row in range(1, ws.max_row + 1):
+        if ws.cell(row=row, column=COL_NAME).value == name:
+            ws.delete_rows(row)
+            wb.save(XLSX_PATH)
+            print(f"  ✅ 本地表格已删除: {name} (第{row}行)")
+            return True
+
+    wb.save(XLSX_PATH)
+    print(f"  ⚠️ 本地表格未找到 {name}")
+    return False
 
 
 # ==================== 主流程 ====================
@@ -359,8 +460,8 @@ def modify_plate(name: str, new_plate: str):
     
     return success
 
-def add_person_full(unit: str, name: str, plate: str, phone: str, 
-                    seal_name: str = "地面月卡", end_time: str = "2030-12-30", 
+def add_person_full(unit: str, name: str, plate: str, phone: str,
+                    seal_name: str = "地面月卡", end_time: str = "2030-12-30",
                     remark: str = ""):
     """新增人员（完整流程：API + 本地表格）"""
     print(f"\n{'='*50}")
@@ -371,22 +472,22 @@ def add_person_full(unit: str, name: str, plate: str, phone: str,
     print(f"  套餐: {seal_name}")
     print(f"  有效期: {end_time}")
     print(f"{'='*50}")
-    
+
     # 1. 登录
     token = login()
     print("[1/6] ✅ 登录成功")
-    
+
     # 2. 查找组织
     group_id, group_name = find_group_id(token, unit)
     if not group_id:
         print(f"[2/6] ❌ 未找到组织: {unit}")
         return False
     print(f"[2/6] ✅ 组织: {group_name}")
-    
+
     # 3. 获取新用户编号
     person_no = get_new_person_no(token)
     print(f"[3/6] ✅ 用户编号: {person_no}")
-    
+
     # 4. 创建用户
     gender = "F" if "娣" in name or "女" in remark else "M"
     person_id, msg = create_person(token, person_no, name, phone, group_id, group_name, remark)
@@ -394,20 +495,20 @@ def add_person_full(unit: str, name: str, plate: str, phone: str,
         print(f"[4/6] ❌ {msg}")
         return False
     print(f"[4/6] ✅ 用户创建成功")
-    
+
     # 5. 添加车牌凭证
     credential_id, msg = add_credential(token, person_id, person_no, name, plate)
     if not credential_id:
         print(f"[5/6] ❌ {msg}")
         return False
     print(f"[5/6] ✅ 车牌凭证添加成功")
-    
+
     # 6. 开通月租车
     seal_id = SEAL_MAP.get(seal_name)
     if not seal_id:
         print(f"[6/6] ⚠️ 未知套餐: {seal_name}，尝试使用名称")
         seal_id = seal_name
-    
+
     success, msg = open_lease_stall(token, person_id, person_no, name, phone,
                                     group_id, group_name, credential_id, plate,
                                     seal_id, seal_name, end_time, gender)
@@ -415,12 +516,111 @@ def add_person_full(unit: str, name: str, plate: str, phone: str,
         print(f"[6/6] ❌ {msg}")
         return False
     print(f"[6/6] ✅ 月租车开通成功")
-    
+
     # 7. 同步本地表格
     sync_add_person(unit, name, plate, phone, "", remark)
-    
+
     print(f"\n{'='*50}")
     print(f"✅ 全部完成！")
+    print(f"{'='*50}")
+    return True
+
+
+# ==================== 删除人员流程 ====================
+
+def delete_person_by_name(name: str):
+    """按姓名删除用户（批量迁出，同时删除用户和车牌凭证）"""
+    print(f"\n{'='*50}")
+    print(f"删除用户(按姓名): {name}")
+    print(f"  操作: 用户管理 → 批量迁出")
+    print(f"  说明: 批量迁出会同时删除用户信息和关联车牌凭证")
+    print(f"{'='*50}")
+
+    # 1. 登录
+    token = login()
+    print("[1/3] ✅ 登录成功")
+
+    # 2. 查找用户
+    persons = query_person(token, name)
+    if not persons:
+        print(f"[2/3] ❌ 未找到用户: {name}")
+        return False
+    print(f"[2/3] ✅ 找到 {len(persons)} 个用户")
+    for p in persons:
+        print(f"  - {p.get('name', '')} | {p.get('mobile', '')} | {p.get('groupName', '')}")
+
+    # 3. 批量迁出
+    person_ids = [p["id"] for p in persons]
+    ok, msg = batch_migrate_out(token, person_ids)
+    if not ok:
+        print(f"[3/3] ❌ {msg}")
+        return False
+    print(f"[3/3] ✅ {msg}")
+
+    # 同步本地表格
+    sync_delete_person(name)
+
+    print(f"\n{'='*50}")
+    print(f"✅ 删除完成！")
+    print(f"{'='*50}")
+    return True
+
+
+def delete_person_by_plate(plate: str):
+    """按车牌删除（先注销车牌凭证，再批量迁出删除用户）"""
+    print(f"\n{'='*50}")
+    print(f"删除用户(按车牌): {plate}")
+    print(f"  操作: 凭证管理 → 注销车牌 → 用户管理 → 批量迁出")
+    print(f"{'='*50}")
+
+    # 1. 登录
+    token = login()
+    print("[1/4] ✅ 登录成功")
+
+    # 2. 查找凭证
+    creds = query_credential(token, plate, by_name=False)
+    if not creds:
+        print(f"[2/4] ❌ 未找到车牌凭证: {plate}")
+        return False
+    print(f"[2/4] ✅ 找到 {len(creds)} 条凭证")
+
+    # 3. 注销凭证
+    active_cred_ids = [c["id"] for c in creds if c.get("status") == 1]
+    skipped = len(creds) - len(active_cred_ids)
+    if active_cred_ids:
+        ok, msg = cancel_credential(token, active_cred_ids)
+        if not ok:
+            print(f"[3/4] ❌ {msg}")
+            return False
+        print(f"[3/4] ✅ 凭证注销成功 ({len(active_cred_ids)} 条)")
+    else:
+        print(f"[3/4] ⏭️ 无需注销（所有凭证已注销）")
+    if skipped:
+        print(f"  ⏭️ 已跳过 {skipped} 条已注销凭证")
+
+    # 4. 查找用户并批量迁出
+    person_name = creds[0].get("personName", "")
+    if not person_name:
+        print("[4/4] ⚠️ 无法获取车主姓名，跳过用户删除")
+        return True
+
+    persons = query_person(token, person_name)
+    if not persons:
+        print(f"[4/4] ⚠️ 未找到用户: {person_name}，车牌已注销但用户未删除")
+        return True
+
+    person_ids = [p["id"] for p in persons]
+    ok, msg = batch_migrate_out(token, person_ids)
+    if not ok:
+        print(f"[4/4] ❌ {msg}")
+        return False
+    print(f"[4/4] ✅ {msg}")
+
+    # 同步本地表格
+    sync_delete_person(person_name)
+
+    print(f"\n{'='*50}")
+    print(f"✅ 删除完成！")
     print(f"{'='*50}")
     return True
 
@@ -431,14 +631,14 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
-    
+
     cmd = sys.argv[1]
-    
+
     if cmd == "modify" and len(sys.argv) >= 4:
         name = sys.argv[2]
         new_plate = sys.argv[3]
         modify_plate(name, new_plate)
-        
+
     elif cmd == "add" and len(sys.argv) >= 7:
         unit = sys.argv[2]
         name = sys.argv[3]
@@ -448,7 +648,15 @@ if __name__ == "__main__":
         end_time = sys.argv[7] if len(sys.argv) > 7 else "2030-12-30"
         remark = sys.argv[8] if len(sys.argv) > 8 else ""
         add_person_full(unit, name, plate, phone, seal_name, end_time, remark)
-        
+
+    elif cmd == "delete-name" and len(sys.argv) >= 3:
+        name = sys.argv[2]
+        delete_person_by_name(name)
+
+    elif cmd == "delete-plate" and len(sys.argv) >= 3:
+        plate = sys.argv[2]
+        delete_person_by_plate(plate)
+
     else:
         print("参数错误，请查看使用方法：")
         print(__doc__)
