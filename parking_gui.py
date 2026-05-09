@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 停车场管理系统 - PyQt5桌面应用
-功能：修改车牌、新增人员、黑白名单管理、本地Excel同步
+功能：修改车牌、新增人员、已有用户增加车牌、删除人员、黑白名单管理、本地Excel同步
 """
 
 import hashlib
@@ -262,6 +262,61 @@ class ParkingAPI:
             return True, f"车牌已修改为 {new_plate}"
         return False, f"修改失败: {res}"
 
+    def add_plate_to_existing_user(self, name: str, new_plate: str):
+        """已有用户增加车牌（保留原车牌，追加新车牌）"""
+        # 1. 查找月租记录
+        lease = self.find_lease_by_name(name)
+        if not lease:
+            return False, f"未找到 {name} 的月租记录"
+
+        # 2. 获取现有车牌列表
+        existing_creds = lease.get('credentiallList', [])
+        existing_plates = [c['credentialNo'] for c in existing_creds]
+        if new_plate in existing_plates:
+            return False, f"车牌 {new_plate} 已存在"
+
+        # 3. 创建新车牌凭证
+        person_id = lease.get('personId')
+        person_no = lease.get('personNo')
+        cred_id, msg = self.add_credential(person_id, person_no, name, new_plate)
+        if not cred_id:
+            return False, msg
+
+        # 4. 合并车牌列表
+        new_plate_color = get_plate_color(new_plate)
+        existing_creds.append({
+            "credentialId": cred_id, "credentialNo": new_plate,
+            "credentialType": 163, "plateColor": new_plate_color, "vechicleType": "1"
+        })
+
+        # 5. 更新月租记录
+        total_cars = len(existing_creds)
+        body = {
+            "id": lease['id'],
+            "personNo": person_no,
+            "personName": name,
+            "mobile": lease['mobile'],
+            "credentialNo": lease.get('credentialNo', new_plate),
+            "credentiallList": existing_creds,
+            "sealId": lease['sealId'],
+            "sealName": lease['sealName'],
+            "userType": 1,
+            "startTime": lease['startTime'],
+            "endTime": lease['endTime'],
+            "carNumber": total_cars,
+            "spaceNumbers": lease.get('spaceNumbers', '1'),
+            "spaceTypeInfoList": lease.get('spaceTypeInfoList', [{"spaceType": 2, "spaceNumber": 1}]),
+            "status": 0
+        }
+        r = requests.put(
+            f"{self.base_url}/api/parkmanagement/pmsLeaseStall/{lease['id']}",
+            headers=self._headers(), json=body, verify=False, timeout=15
+        )
+        res = r.json()
+        if res.get("code") == 200:
+            return True, f"已为 {name} 增加车牌 {new_plate}（共 {total_cars} 个车牌: {', '.join(existing_plates + [new_plate])}）"
+        return False, f"增加失败: {res}"
+
     # ---- 黑白名单 ----
 
     def add_bw_record(self, plate, list_type, start_date, end_date, remark=""):
@@ -435,6 +490,25 @@ def sync_delete_person(xlsx_path, name):
     return False, f"本地表格未找到 {name}"
 
 
+def sync_add_plate_to_existing(xlsx_path, name, new_plate):
+    """已有用户增加车牌 - 同步到本地表格"""
+    wb = openpyxl.load_workbook(xlsx_path)
+    ws = wb.active
+    for row in range(1, ws.max_row + 1):
+        if ws.cell(row=row, column=COL_NAME).value == name:
+            old_plate = ws.cell(row=row, column=COL_PLATE).value or ""
+            if new_plate in str(old_plate):
+                wb.close()
+                return False, f"车牌 {new_plate} 已存在于本地表格"
+            merged = f"{old_plate}\n{new_plate}" if old_plate else new_plate
+            ws.cell(row=row, column=COL_PLATE).value = merged
+            ws.cell(row=row, column=COL_PLATE).alignment = Alignment(wrap_text=True)
+            wb.save(xlsx_path)
+            return True, f"本地表格已更新: {name} 车牌追加 {new_plate}"
+    wb.save(xlsx_path)
+    return False, f"本地表格未找到 {name}"
+
+
 # ==================== 登录对话框 ====================
 
 class LoginDialog(QDialog):
@@ -554,6 +628,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(ModifyPlateTab(self), "修改车牌")
         self.tabs.addTab(AddPersonTab(self), "新增人员")
+        self.tabs.addTab(AddPlateTab(self), "增加车牌")
         self.tabs.addTab(DeletePersonTab(self), "删除人员")
         self.tabs.addTab(BlackWhiteListTab(self), "黑白名单")
         layout.addWidget(self.tabs)
@@ -1166,6 +1241,119 @@ class DeletePersonTab(QWidget):
             self.delete_btn.setEnabled(True)
 
         self.main.run_worker(do_delete, on_ok)
+
+
+# ==================== 增加车牌Tab ====================
+
+class AddPlateTab(QWidget):
+    """已有用户增加车牌（月租变更追加，保留原车牌）"""
+    def __init__(self, main: MainWindow):
+        super().__init__()
+        self.main = main
+        self.current_lease = None
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("输入姓名查询")
+
+        search_btn = QPushButton("查询")
+        search_btn.setFixedWidth(60)
+        search_btn.clicked.connect(self._on_search)
+        name_row = QHBoxLayout()
+        name_row.addWidget(self.name_edit)
+        name_row.addWidget(search_btn)
+        form.addRow("姓  名:", name_row)
+
+        self.new_plate_edit = QLineEdit()
+        self.new_plate_edit.setPlaceholderText("例: 粤B88888")
+        form.addRow("新车牌:", self.new_plate_edit)
+
+        self.info_label = QLabel("")
+        self.info_label.setStyleSheet("color: #1565C0; font-weight: bold;")
+        form.addRow("当前车牌:", self.info_label)
+
+        self.sync_check = QCheckBox("同步更新本地Excel")
+        self.sync_check.setChecked(True)
+        form.addRow(self.sync_check)
+
+        layout.addLayout(form)
+
+        self.add_btn = QPushButton("增加车牌")
+        self.add_btn.setFixedHeight(36)
+        self.add_btn.setEnabled(False)
+        self.add_btn.clicked.connect(self._on_add)
+        layout.addWidget(self.add_btn)
+        layout.addStretch()
+
+    def _on_search(self):
+        name = self.name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "提示", "请输入姓名")
+            return
+        self.add_btn.setEnabled(False)
+        self.info_label.setText("查询中...")
+        self.main.log(f"查询月租记录: {name}")
+
+        def do_search():
+            return self.main.api.find_lease_by_name(name)
+
+        def on_ok(lease):
+            self.current_lease = lease
+            if lease:
+                existing_creds = lease.get('credentiallList', [])
+                plates = [c['credentialNo'] for c in existing_creds]
+                seal = lease.get("sealName", "")
+                end = lease.get("endTime", "")[:10]
+                self.info_label.setText(
+                    f"现有车牌: {', '.join(plates)} | 套餐: {seal} | 到期: {end}"
+                )
+                self.add_btn.setEnabled(True)
+                self.main.log(f"找到: {', '.join(plates)}")
+            else:
+                self.info_label.setText("未找到该人员的月租记录")
+                self.main.log("未找到记录")
+
+        self.main.run_worker(do_search, on_ok)
+
+    def _on_add(self):
+        new_plate = self.new_plate_edit.text().strip()
+        if not new_plate:
+            QMessageBox.warning(self, "提示", "请输入新车牌")
+            return
+        if not self.current_lease:
+            return
+
+        self.add_btn.setEnabled(False)
+        name = self.name_edit.text().strip()
+        self.main.log(f"增加车牌: {name} + {new_plate}")
+
+        def do_add():
+            return self.main.api.add_plate_to_existing_user(name, new_plate)
+
+        def on_ok(result):
+            ok, msg = result
+            self.main.log(msg)
+            if ok:
+                if self.sync_check.isChecked() and self.main.xlsx_path:
+                    try:
+                        sync_ok, sync_msg = sync_add_plate_to_existing(
+                            self.main.xlsx_path, name, new_plate
+                        )
+                        self.main.log(sync_msg)
+                    except Exception as e:
+                        self.main.log(f"Excel同步失败: {e}")
+                QMessageBox.information(self, "成功", msg)
+                self.new_plate_edit.clear()
+                self._on_search()  # 刷新显示
+            else:
+                QMessageBox.warning(self, "失败", msg)
+            self.add_btn.setEnabled(True)
+
+        self.main.run_worker(do_add, on_ok)
 
 
 # ==================== 黑白名单Tab ====================
