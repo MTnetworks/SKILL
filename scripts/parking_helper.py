@@ -8,12 +8,14 @@
 3. 黑白名单操作 → 仅API操作，不同步本地表格
 4. 删除人员(按姓名) → 用户管理批量迁出，同时删除用户和关联车牌凭证
 5. 删除人员(按车牌) → 先注销车牌凭证，再批量迁出删除用户信息
+6. 已有用户增加车牌 → 月租变更追加车牌（保留原车牌）
 
 表格路径: F:\ShareCache\智能化系统\门禁系统\2024政府年门禁、车牌审核汇总表.xlsx
 
 使用方法：
   python parking_helper.py modify <姓名> <新车牌>
   python parking_helper.py add <单位> <姓名> <车牌> <电话> <套餐> <有效期> [备注]
+  python parking_helper.py add-plate <姓名> <新车牌>
   python parking_helper.py delete-name <姓名>
   python parking_helper.py delete-plate <车牌号>
 
@@ -37,7 +39,7 @@ urllib3.disable_warnings()
 
 # ==================== 配置 ====================
 BASE_URL = "https://10.0.12.1:9091"
-ACCOUNT = "9999"
+ACCOUNT = "9990"
 PASSWORD = "88888888"
 
 # 本地表格路径 (Windows路径 -> WSL路径)
@@ -437,6 +439,29 @@ def sync_delete_person(name: str):
     print(f"  ⚠️ 本地表格未找到 {name}")
     return False
 
+def sync_add_plate_to_existing(name: str, new_plate: str):
+    """已有用户增加车牌 - 同步到本地表格"""
+    wb = openpyxl.load_workbook(XLSX_PATH)
+    ws = wb.active
+
+    for row in range(1, ws.max_row + 1):
+        if ws.cell(row=row, column=COL_NAME).value == name:
+            old_plate = ws.cell(row=row, column=COL_PLATE).value or ""
+            if new_plate in str(old_plate):
+                print(f"  ⚠️ 车牌 {new_plate} 已存在于本地表格")
+                wb.close()
+                return False
+            merged = f"{old_plate}\n{new_plate}" if old_plate else new_plate
+            ws.cell(row=row, column=COL_PLATE).value = merged
+            ws.cell(row=row, column=COL_PLATE).alignment = Alignment(wrap_text=True)
+            wb.save(XLSX_PATH)
+            print(f"  ✅ 本地表格已更新: {name} 车牌追加 {new_plate}")
+            return True
+
+    wb.save(XLSX_PATH)
+    print(f"  ⚠️ 本地表格未找到 {name}")
+    return False
+
 
 # ==================== 主流程 ====================
 
@@ -625,6 +650,96 @@ def delete_person_by_plate(plate: str):
     return True
 
 
+# ==================== 已有用户增加车牌 ====================
+
+def add_plate_to_existing_user(name: str, new_plate: str):
+    """已有用户增加车牌（完整流程：API + 本地表格）"""
+    print(f"\n{'='*50}")
+    print(f"已有用户增加车牌: {name} + {new_plate}")
+    print(f"  方式: 月租变更（保留原车牌，追加新车牌）")
+    print(f"{'='*50}")
+
+    # 1. 登录
+    token = login()
+    print("[1/5] ✅ 登录成功")
+
+    # 2. 查找月租记录
+    lease = find_lease_by_name(token, name)
+    if not lease:
+        print(f"[2/5] ❌ 未找到 {name} 的月租记录")
+        return False
+    print(f"[2/5] ✅ 找到月租记录")
+
+    # 3. 获取现有车牌列表
+    existing_creds = lease.get('credentiallList', [])
+    existing_plates = [c['credentialNo'] for c in existing_creds]
+    print(f"[3/5] 现有车牌: {existing_plates}")
+
+    if new_plate in existing_plates:
+        print(f"[3/5] ⚠️ 车牌 {new_plate} 已存在，无需重复添加")
+        return False
+
+    # 4. 创建新车牌凭证
+    person_id = lease.get('personId')
+    person_no = lease.get('personNo')
+    cred_id, cred_msg = add_credential(token, person_id, person_no, name, new_plate)
+    if not cred_id:
+        print(f"[4/5] ❌ {cred_msg}")
+        return False
+    print(f"[4/5] ✅ 新车牌凭证创建成功")
+
+    # 5. 合并车牌列表并更新月租
+    new_plate_color = get_plate_color(new_plate)
+    existing_creds.append({
+        "credentialId": cred_id,
+        "credentialNo": new_plate,
+        "credentialType": 163,
+        "plateColor": new_plate_color,
+        "vechicleType": "1"
+    })
+
+    total_cars = len(existing_creds)
+    body = {
+        "id": lease['id'],
+        "personNo": person_no,
+        "personName": name,
+        "mobile": lease['mobile'],
+        "credentialNo": lease.get('credentialNo', new_plate),
+        "credentiallList": existing_creds,
+        "sealId": lease['sealId'],
+        "sealName": lease['sealName'],
+        "userType": 1,
+        "startTime": lease['startTime'],
+        "endTime": lease['endTime'],
+        "carNumber": total_cars,
+        "spaceNumbers": lease.get('spaceNumbers', '1'),
+        "spaceTypeInfoList": lease.get('spaceTypeInfoList', [{"spaceType": 2, "spaceNumber": 1}]),
+        "status": 0
+    }
+
+    r = requests.put(
+        f"{BASE_URL}/api/parkmanagement/pmsLeaseStall/{lease['id']}",
+        headers=get_headers(token),
+        json=body,
+        verify=False, timeout=15
+    )
+
+    result = r.json()
+    if result.get('code') != 200:
+        print(f"[5/5] ❌ 月租更新失败: {result}")
+        return False
+    print(f"[5/5] ✅ 月租更新成功（共 {total_cars} 个车牌）")
+    print(f"   当前所有车牌: {[c['credentialNo'] for c in existing_creds]}")
+
+    # 同步本地表格
+    sync_add_plate_to_existing(name, new_plate)
+
+    print(f"\n{'='*50}")
+    print(f"✅ 全部完成！{name} 已增加车牌 {new_plate}")
+    print(f"{'='*50}")
+    return True
+
+
 # ==================== 入口 ====================
 
 if __name__ == "__main__":
@@ -648,6 +763,11 @@ if __name__ == "__main__":
         end_time = sys.argv[7] if len(sys.argv) > 7 else "2030-12-30"
         remark = sys.argv[8] if len(sys.argv) > 8 else ""
         add_person_full(unit, name, plate, phone, seal_name, end_time, remark)
+
+    elif cmd == "add-plate" and len(sys.argv) >= 4:
+        name = sys.argv[2]
+        new_plate = sys.argv[3]
+        add_plate_to_existing_user(name, new_plate)
 
     elif cmd == "delete-name" and len(sys.argv) >= 3:
         name = sys.argv[2]
