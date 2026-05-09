@@ -1,6 +1,6 @@
 ---
 name: parking-whitelist
-description: 停车场系统管理 - 黑白名单管理、用户管理、月租车开通、车牌凭证管理、删除人员注销车牌
+description: 停车场系统管理 - 黑白名单管理、用户管理、月租车开通、车牌凭证管理、删除人员注销车牌、已有用户增加车牌
 triggers:
   - 白名单
   - 黑名单
@@ -14,6 +14,8 @@ triggers:
   - 注销车牌
   - 删除人员
   - 批量迁出
+  - 增加车牌
+  - 再加一个车牌
 ---
 
 # 停车场系统管理功能
@@ -28,7 +30,7 @@ triggers:
 
 ## 认证信息
 
-- **账号**: 9999
+- **账号**: 9990
 - **密码**: 88888888
 - **登录API**: `/api/systemcenter/auth/login`
 - **密码加密**: MD5
@@ -56,7 +58,7 @@ base_url = "https://10.0.12.1:9091"
 password_md5 = hashlib.md5("88888888".encode()).hexdigest()
 resp = requests.post(
     f"{base_url}/api/systemcenter/auth/login",
-    json={"account": "9999", "password": password_md5},
+    json={"account": "9990", "password": password_md5},
     verify=False
 )
 token = resp.json()['data']['token']
@@ -397,7 +399,7 @@ urllib3.disable_warnings()
 base_url = "https://10.0.12.1:9091"
 pw = hashlib.md5("88888888".encode()).hexdigest()
 r = requests.post(f"{base_url}/api/systemcenter/auth/login",
-    json={"account": "9999", "password": pw}, verify=False, timeout=10)
+    json={"account": "9990", "password": pw}, verify=False, timeout=10)
 token = r.json()['data']['token']
 headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
@@ -524,6 +526,148 @@ python parking_helper.py delete-plate 粤S22222
 
 ---
 
+## 功能八：已有用户增加车牌
+
+### 适用场景
+
+用户已开通月租车，需要为同一用户**增加一个额外车牌**（保留原有车牌）。
+
+**注意**：此功能是「增加」车牌，不是「修改」车牌。原车牌继续有效，新车牌同时生效。
+
+### 实现方式：通过月租变更 API
+
+月租变更 API（PUT `/api/parkmanagement/pmsLeaseStall/{leaseId}`）支持 `credentiallList` 数组，在列表中追加新车牌即可同时生效。
+
+### API 流程
+
+```
+1. 登录获取 Token
+2. 查询用户月租记录 (GET pmsLeaseStallList?personName=姓名)
+3. 从月租记录中获取现有车牌列表 (credentiallList)
+4. 创建新车牌凭证 (POST /api/systemcenter/credential)
+5. 合并车牌列表（旧 + 新）
+6. 更新月租记录 (PUT pmsLeaseStall/{leaseId})
+   → carNumber 更新为车牌总数
+   → credentialNo 更新为新车牌（主车牌）
+   → credentiallList 包含全部车牌
+```
+
+### 完整代码示例
+
+```python
+import hashlib, requests, urllib3
+from datetime import datetime
+
+urllib3.disable_warnings()
+
+base_url = "https://10.0.12.1:9091"
+pw = hashlib.md5("88888888".encode()).hexdigest()
+r = requests.post(f"{base_url}/api/systemcenter/auth/login",
+    json={"account": "9990", "password": pw}, verify=False, timeout=10)
+token = r.json()['data']['token']
+headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+# ========== 参数 ==========
+user_name = "陈座娣"
+new_plate = "粤B88888"
+
+# ========== 步骤1: 查找月租记录 ==========
+r = requests.get(f"{base_url}/api/parkmanagement/pmsLeaseStall/pmsLeaseStallList",
+    headers=headers, params={"pageIndex": 0, "pageSize": 10, "personName": user_name},
+    verify=False, timeout=10)
+rows = r.json()['data']['rows']
+if not rows:
+    raise Exception(f"未找到 {user_name} 的月租记录")
+lease = rows[0]
+
+# 提取用户信息
+person_id = lease['personId']
+person_no = lease['personNo']
+lease_id = lease['id']
+
+# ========== 步骤2: 获取现有车牌列表 ==========
+existing_creds = lease.get('credentiallList', [])
+existing_plates = [c['credentialNo'] for c in existing_creds]
+print(f"现有车牌: {existing_plates}")
+
+# 检查是否重复
+if new_plate in existing_plates:
+    raise Exception(f"车牌 {new_plate} 已存在")
+
+# ========== 步骤3: 创建新车牌凭证 ==========
+def get_plate_color(plate):
+    if len(plate) == 8 and plate[:2] in ["粤B", "粤D", "粤F"]:
+        return 5  # 绿牌
+    return 3  # 蓝牌
+
+plate_color = get_plate_color(new_plate)
+cred_data = {
+    "personId": person_id,
+    "personNo": person_no,
+    "personName": user_name,
+    "credentialNo": new_plate,
+    "credentialType": 163,
+    "plate": new_plate,
+    "plateColor": plate_color,
+    "vehicleType": 0,
+    "status": 1
+}
+r = requests.post(f"{base_url}/api/systemcenter/credential",
+    headers=headers, json=cred_data, verify=False, timeout=10)
+new_cred_id = r.json()['data']['id']
+print(f"新车牌凭证ID: {new_cred_id}")
+
+# ========== 步骤4: 合并车牌列表（旧 + 新）==========
+existing_creds.append({
+    "credentialId": new_cred_id,
+    "credentialNo": new_plate,
+    "credentialType": 163,
+    "plateColor": plate_color,
+    "vechicleType": "1"
+})
+
+total_cars = len(existing_creds)
+print(f"合并后车牌数: {total_cars}")
+
+# ========== 步骤5: 更新月租记录 ==========
+body = {
+    "id": lease_id,
+    "personNo": person_no,
+    "personName": user_name,
+    "mobile": lease['mobile'],
+    "credentialNo": new_plate if total_cars == 1 else lease.get('credentialNo', new_plate),
+    "credentiallList": existing_creds,
+    "sealId": lease['sealId'],
+    "sealName": lease['sealName'],
+    "userType": 1,
+    "startTime": lease['startTime'],
+    "endTime": lease['endTime'],
+    "carNumber": total_cars,
+    "spaceNumbers": lease.get('spaceNumbers', '1'),
+    "spaceTypeInfoList": lease.get('spaceTypeInfoList', [{"spaceType": 2, "spaceNumber": 1}]),
+    "status": 0
+}
+
+r = requests.put(f"{base_url}/api/parkmanagement/pmsLeaseStall/{lease_id}",
+    headers=headers, json=body, verify=False, timeout=15)
+
+result = r.json()
+if result.get('code') == 200:
+    print(f"✅ 成功为 {user_name} 增加车牌 {new_plate}")
+    print(f"   当前所有车牌: {[c['credentialNo'] for c in existing_creds]}")
+else:
+    print(f"❌ 失败: {result}")
+```
+
+### 命令行工具
+
+```bash
+# 为已有用户增加车牌
+python parking_helper.py add-plate 陈座娣 粤B88888
+```
+
+---
+
 ## 本地表格同步
 
 系统会自动将人员和车牌信息同步到本地Excel表格。
@@ -576,6 +720,7 @@ python parking_helper.py add 专班 张一 粤S22222 18099996666
 - "修改用户朱xx的车牌为粤Sxxxx"
 - "删除姓名：张三" → 用户管理批量迁出，同时删除用户和车牌
 - "删除车牌：粤S22222" → 先注销车牌凭证，再批量迁出删除用户
+- "给陈座娣再加一个粤B88888"或"为xxx增加一个车牌粤xxx" → 已有用户增加车牌
 
 ### 命令行工具示例
 
@@ -585,6 +730,9 @@ python parking_helper.py modify 张一 粤S22222
 
 # 新增人员（API创建用户+凭证+月租 + 本地表格同步）
 python parking_helper.py add 卫生健康局 陈座娣 粤BF7889 13480980000 地面月卡 2030-12-30 借调
+
+# 已有用户增加车牌（月租变更追加）
+python parking_helper.py add-plate 陈座娣 粤B88888
 
 # 按姓名删除（批量迁出，同时删除用户和关联车牌）
 python parking_helper.py delete-name 张一
